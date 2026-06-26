@@ -63,26 +63,23 @@ Watch these **before** reading the paper. Makes everything click way faster.
 
 | Title | Source | When to Watch |
 |-------|--------|---------------|
-| [Graph Neural Networks — Stanford CS224W Lecture 8](https://www.youtube.com/watch?v=vinDY-0ij-8) | Jure Leskovec (the author!) | Before reading |
+| [Graph Neural Networks — Stanford CS224W Lecture 8](https://www.youtube.com/watch?v=LLUxwHc7O4A) | Jure Leskovec (the author!) | Before reading |
 | [Large-scale Graph Representation Learning](https://www.youtube.com/watch?v=oQL4E1gK3VU) | Jure Leskovec @ ICLR | After first read |
-| [GraphSAGE Explained Simply](https://www.youtube.com/watch?v=vinDY-0ij-8) | Stanford CS224W | Anytime |
 
-> 💡 The full CS224W playlist is gold. If you have time, just watch the whole GNN series.
+
 
 ---
 
-## 📖 Blogs & Tutorials (Read in This Order)
+## 📖 Blogs & Tutorials 
 
-These are much friendlier than the paper. Start here if the paper feels heavy.
-
-### 1. Big Picture First
+### 1. Big Picture 
 - [**GraphSAGE: Scaling up GNNs** — Towards Data Science](https://towardsdatascience.com/introduction-to-graphsage-in-python-a9e7f9ecf9d7/)
   Great intro, covers Pinterest/UberEats use cases, explains mini-batching and aggregators clearly.
 
 - [**Graph SAGE — IIT Roorkee DSG Blog**](https://dsgiitr.in/blogs/graph_sage/)
   Solid conceptual breakdown, nice diagrams, explains parameter sharing well.
 
-### 2. Algorithm Deep Dive
+### 2.Deep Dive
 - [**GraphSAGE Sampling & Aggregation** — apxml.com](https://apxml.com/courses/introduction-to-graph-neural-networks/chapter-3-foundational-gnn-architectures/graphsage-model)
   Best breakdown of the two-step sample → aggregate process with the math.
 
@@ -98,7 +95,7 @@ These are much friendlier than the paper. Start here if the paper feels heavy.
 
 ---
 
-## 💻 GitHub Repos to Practice With 
+## 💻 GitHub Repos for Practice 
 
 These are ordered from "easiest to get started" to "closest to the original paper."
 
@@ -120,7 +117,6 @@ jupyter notebook GraphSAGE_Code+Blog.ipynb
 
 | Resource | What it covers |
 |----------|---------------|
-| [GCN Paper (Kipf & Welling, 2017)](https://arxiv.org/abs/1609.02907) | What GraphSAGE improves upon |
 | [PinSAGE (Ying et al., 2018)](https://arxiv.org/abs/1806.01973) | GraphSAGE at Pinterest scale |
 | [Graph Representation Learning Book](https://www.cs.mcgill.ca/~wlh/grl_book/) | Free book by Hamilton (GraphSAGE author) |
 | [PyTorch Geometric Docs](https://pytorch-geometric.readthedocs.io/) | SAGEConv implementation reference |
