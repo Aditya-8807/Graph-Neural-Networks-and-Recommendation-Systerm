@@ -2,6 +2,7 @@ import os
 import json
 import time
 import threading
+import numpy as np
 from datetime import datetime, timedelta
 from typing import List, Optional
 from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks, Query

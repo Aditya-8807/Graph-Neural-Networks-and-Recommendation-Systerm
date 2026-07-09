@@ -93,7 +93,14 @@ class GraphSAGEModel(nn.Module):
             nn.ReLU(),
             nn.Linear(32, 1)
         )
-        
+
+        # Link-prediction score is a dot product between L2-normalized embeddings
+        # (see BipartiteSAGEConv/get_movie_features), so it's bounded to [-1, 1] as a
+        # cosine similarity. Without a scale, sigmoid(dot) can never get confident
+        # (max/min ~0.73/0.27), which stalls BCE training near the ln(2) random-guess
+        # loss. This learnable temperature lets the model use the full logit range.
+        self.link_scale = nn.Parameter(torch.tensor(5.0))
+
     def get_movie_features(self, movie_genres):
         """
         Calculates initial movie representations combining ID embedding and genre features.
@@ -115,35 +122,23 @@ class GraphSAGEModel(nn.Module):
         - user_to_movie_edges: [2, E] - [0] is user index, [1] is movie index
         - movie_to_user_edges: [2, E] - [0] is movie index, [1] is user index
         """
-        num_users = self.user_emb.weight.size(0)
-        num_movies = self.movie_emb.weight.size(0)
-        
-        # Initial representations
-        h_u = self.user_emb.weight
-        h_m = self.get_movie_features(movie_genres)
-        
-        # Layer 1
-        h_m_1 = self.movie_conv1(h_u, h_m, user_to_movie_edges, num_movies)
-        h_u_1 = self.user_conv1(h_m, h_u, movie_to_user_edges, num_users)
-        
-        # Layer 2
-        h_m_2 = self.movie_conv2(h_u_1, h_m_1, user_to_movie_edges, num_movies)
-        h_u_2 = self.user_conv2(h_m_1, h_u_1, movie_to_user_edges, num_users)
-        
-        # Extract features for prediction batch
-        u_feat = h_u_2[user_ids]
-        m_feat = h_m_2[movie_ids]
-        
-        # Concatenate features and interaction term
+        h_u_2, h_m_2 = self.encode(movie_genres, user_to_movie_edges, movie_to_user_edges)
+        pred = self.predict_rating(h_u_2, h_m_2, user_ids, movie_ids)
+        return pred, h_u_2, h_m_2
+
+    def predict_rating(self, h_u, h_m, user_ids, movie_ids):
+        """Rating-regression head on top of already-encoded node embeddings."""
+        u_feat = h_u[user_ids]
+        m_feat = h_m[movie_ids]
         combined = torch.cat([u_feat, m_feat, u_feat * m_feat], dim=-1)
-        
-        # Predict rating
         pred = self.pred_mlp(combined).squeeze(-1)
         # Clamp between 1.0 and 5.0
-        pred = 1.0 + 4.0 * torch.sigmoid(pred)
-        
-        return pred, h_u_2, h_m_2
-        
+        return 1.0 + 4.0 * torch.sigmoid(pred)
+
+    def link_score(self, h_u, h_m, user_ids, movie_ids):
+        """Temperature-scaled dot-product link-prediction logit (for BCE + negative sampling)."""
+        return self.link_scale * (h_u[user_ids] * h_m[movie_ids]).sum(dim=-1)
+
     def encode(self, movie_genres, user_to_movie_edges, movie_to_user_edges):
         """
         Helper to run GNN encoding and return final node embeddings.

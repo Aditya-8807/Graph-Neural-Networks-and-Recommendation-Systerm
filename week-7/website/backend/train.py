@@ -7,7 +7,7 @@ import time
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from database import get_db_connection, init_db, add_training_log, hash_password
 from model import GraphSAGEModel
@@ -212,6 +212,75 @@ def build_mappings_and_features():
         "num_genres": len(genres_list)
     }, movie_genres_matrix
 
+def split_train_test_per_user(ratings_rows, test_frac=0.2, min_ratings_for_split=5, seed=0):
+    """
+    Per-user train/test split. Splitting globally at random can leave some users
+    with zero training interactions, which breaks the bipartite graph for exactly
+    the users we most want to evaluate. Users with too few ratings to split
+    reliably keep everything in train and are skipped during evaluation.
+    """
+    import random
+    by_user = {}
+    for r in ratings_rows:
+        by_user.setdefault(r["user_id"], []).append(r)
+
+    rng = random.Random(seed)
+    train_rows, test_rows = [], []
+    for uid, rows in by_user.items():
+        rows = list(rows)
+        rng.shuffle(rows)
+        if len(rows) < min_ratings_for_split:
+            train_rows.extend(rows)
+            continue
+        n_test = max(1, int(test_frac * len(rows)))
+        test_rows.extend(rows[:n_test])
+        train_rows.extend(rows[n_test:])
+    return train_rows, test_rows
+
+
+def sample_negative_movies(user_batch, user_train_movies, num_movies, device):
+    """For each user in user_batch, sample one movie index they have not rated in train."""
+    neg_m = torch.randint(0, num_movies, (len(user_batch),), device=device)
+    for i, u in enumerate(user_batch.tolist()):
+        seen = user_train_movies.get(u, set())
+        while neg_m[i].item() in seen:
+            neg_m[i] = torch.randint(0, num_movies, (1,), device=device)
+    return neg_m
+
+
+def evaluate_model(model, movie_genres_tensor, user_to_movie_edges, movie_to_user_edges,
+                    test_users, test_movies, test_ratings, user_train_movies, user_test_movies,
+                    num_movies, k=10):
+    """RMSE on held-out ratings + Precision@K/Recall@K on held-out interactions."""
+    model.eval()
+    with torch.no_grad():
+        h_u, h_m = model.encode(movie_genres_tensor, user_to_movie_edges, movie_to_user_edges)
+
+        if len(test_users) > 0:
+            test_pred = model.predict_rating(h_u, h_m, test_users, test_movies)
+            rmse = torch.sqrt(F.mse_loss(test_pred, test_ratings)).item()
+        else:
+            rmse = None
+
+        all_scores = h_u @ h_m.t()
+        precisions, recalls = [], []
+        for u_idx, test_m_set in user_test_movies.items():
+            scores = all_scores[u_idx].clone()
+            seen = user_train_movies.get(u_idx, set())
+            if seen:
+                scores[list(seen)] = float('-inf')
+            topk = torch.topk(scores, min(k, num_movies)).indices.tolist()
+            hits = len(set(topk) & test_m_set)
+            precisions.append(hits / k)
+            recalls.append(hits / len(test_m_set))
+
+        precision_at_k = float(np.mean(precisions)) if precisions else None
+        recall_at_k = float(np.mean(recalls)) if recalls else None
+
+    model.train()
+    return rmse, precision_at_k, recall_at_k
+
+
 def train_model(epochs=15, batch_size=512, lr=0.01, embedding_dim=64):
     start_time = time.strftime("%Y-%m-%d %H:%M:%S")
     add_training_log(start_time, "running", loss=None, metrics="Training started...")
@@ -243,34 +312,49 @@ def train_model(epochs=15, batch_size=512, lr=0.01, embedding_dim=64):
         
         if len(ratings_rows) == 0:
             raise Exception("No active user ratings found in database. Cannot train.")
-            
+
         print(f"Training on {len(ratings_rows)} active ratings.")
-        
-        # Build rating tensors
-        train_users = []
-        train_movies = []
-        train_ratings = []
-        
-        for r in ratings_rows:
-            uid = r["user_id"]
-            mid = r["movie_id"]
-            if uid in user_to_idx and mid in movie_to_idx:
-                train_users.append(user_to_idx[uid])
-                train_movies.append(movie_to_idx[mid])
-                train_ratings.append(r["rating"])
-                
+
+        # Held-out per-user split, so we can actually measure whether the model
+        # generalizes instead of only tracking training-batch loss.
+        train_rows, test_rows = split_train_test_per_user(ratings_rows)
+        print(f"Split: {len(train_rows)} train ratings, {len(test_rows)} test ratings.")
+
+        def rows_to_idx_lists(rows):
+            users, movies, ratings = [], [], []
+            for r in rows:
+                uid, mid = r["user_id"], r["movie_id"]
+                if uid in user_to_idx and mid in movie_to_idx:
+                    users.append(user_to_idx[uid])
+                    movies.append(movie_to_idx[mid])
+                    ratings.append(r["rating"])
+            return users, movies, ratings
+
+        train_users, train_movies, train_ratings = rows_to_idx_lists(train_rows)
+        test_users_l, test_movies_l, test_ratings_l = rows_to_idx_lists(test_rows)
+
         user_tensor = torch.tensor(train_users, dtype=torch.long)
         movie_tensor = torch.tensor(train_movies, dtype=torch.long)
         rating_tensor = torch.tensor(train_ratings, dtype=torch.float32)
-        
-        # Build GNN Edges (all rating interactions)
+
+        # Per-user sets of movies seen in TRAIN (for negative sampling + masking
+        # already-seen movies out of the eval ranking) and held out in TEST.
+        user_train_movies = {}
+        for u, m in zip(train_users, train_movies):
+            user_train_movies.setdefault(u, set()).add(m)
+        user_test_movies = {}
+        for u, m in zip(test_users_l, test_movies_l):
+            user_test_movies.setdefault(u, set()).add(m)
+
+        # Build GNN Edges from TRAIN interactions only, so held-out test edges
+        # don't leak into message passing.
         user_to_movie_edges = torch.stack([user_tensor, movie_tensor], dim=0) # [2, E]
         movie_to_user_edges = torch.stack([movie_tensor, user_tensor], dim=0) # [2, E]
-        
+
         # Device
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Training on device: {device}")
-        
+
         # Transfer data to device
         movie_genres_tensor = torch.tensor(movie_genres_np, dtype=torch.float32).to(device)
         user_to_movie_edges = user_to_movie_edges.to(device)
@@ -278,7 +362,10 @@ def train_model(epochs=15, batch_size=512, lr=0.01, embedding_dim=64):
         user_tensor = user_tensor.to(device)
         movie_tensor = movie_tensor.to(device)
         rating_tensor = rating_tensor.to(device)
-        
+        test_users = torch.tensor(test_users_l, dtype=torch.long, device=device)
+        test_movies = torch.tensor(test_movies_l, dtype=torch.long, device=device)
+        test_ratings = torch.tensor(test_ratings_l, dtype=torch.float32, device=device)
+
         # Initialize model
         model = GraphSAGEModel(
             num_users=len(user_to_idx),
@@ -286,57 +373,71 @@ def train_model(epochs=15, batch_size=512, lr=0.01, embedding_dim=64):
             num_genres=mappings["num_genres"],
             embedding_dim=embedding_dim
         ).to(device)
-        
+
         optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
-        criterion = nn.MSELoss()
-        
+        num_movies = len(movie_to_idx)
+        rating_loss_weight = 0.1
+
         dataset_size = len(train_users)
-        
-        # Training loop
+
+        # Training loop: joint link-prediction (BCE + negative sampling) and
+        # rating-regression (MSE) objective. The link-prediction part is what
+        # actually makes this a "link prediction" GraphSAGE model instead of
+        # pure rating regression, and lets us rank candidate movies for Precision@K
+        # / Recall@K instead of only predicting a rating value.
         model.train()
         epoch_losses = []
         for epoch in range(epochs):
             permutation = torch.randperm(dataset_size)
             epoch_loss = 0.0
             num_batches = 0
-            
+
             for i in range(0, dataset_size, batch_size):
                 indices = permutation[i:i + batch_size]
                 batch_users = user_tensor[indices]
                 batch_movies = movie_tensor[indices]
                 batch_ratings = rating_tensor[indices]
-                
+                batch_neg_movies = sample_negative_movies(batch_users, user_train_movies, num_movies, device)
+
                 optimizer.zero_grad()
-                pred, _, _ = model(
-                    batch_users, 
-                    batch_movies, 
-                    movie_genres_tensor, 
-                    user_to_movie_edges, 
-                    movie_to_user_edges
-                )
-                
-                loss = criterion(pred, batch_ratings)
+                h_u, h_m = model.encode(movie_genres_tensor, user_to_movie_edges, movie_to_user_edges)
+
+                pos_logits = model.link_score(h_u, h_m, batch_users, batch_movies)
+                neg_logits = model.link_score(h_u, h_m, batch_users, batch_neg_movies)
+                link_labels = torch.cat([torch.ones_like(pos_logits), torch.zeros_like(neg_logits)])
+                link_logits = torch.cat([pos_logits, neg_logits])
+                link_loss = F.binary_cross_entropy_with_logits(link_logits, link_labels)
+
+                rating_pred = model.predict_rating(h_u, h_m, batch_users, batch_movies)
+                rating_loss = F.mse_loss(rating_pred, batch_ratings)
+
+                loss = link_loss + rating_loss_weight * rating_loss
                 loss.backward()
                 optimizer.step()
-                
+
                 epoch_loss += loss.item()
                 num_batches += 1
-                
+
             mean_loss = epoch_loss / num_batches
             epoch_losses.append(mean_loss)
             print(f"Epoch {epoch+1}/{epochs} | Loss: {mean_loss:.4f}")
-            
-        # Get final embeddings and save
+
+        # Held-out evaluation
+        test_rmse, precision_at_10, recall_at_10 = evaluate_model(
+            model, movie_genres_tensor, user_to_movie_edges, movie_to_user_edges,
+            test_users, test_movies, test_ratings, user_train_movies, user_test_movies,
+            num_movies, k=10
+        )
+        print(f"Eval | RMSE: {test_rmse} | Precision@10: {precision_at_10} | Recall@10: {recall_at_10}")
+
+        # Get final embeddings and save (encode on the TRAIN graph - the same
+        # graph the model was trained on - so saved embeddings match model_state_dict)
         model.eval()
         with torch.no_grad():
-            _, final_user_emb, final_movie_emb = model(
-                user_tensor[:10], # dummy batch to trigger forward
-                movie_tensor[:10],
-                movie_genres_tensor,
-                user_to_movie_edges,
-                movie_to_user_edges
+            final_user_emb, final_movie_emb = model.encode(
+                movie_genres_tensor, user_to_movie_edges, movie_to_user_edges
             )
-            
+
         # Save checkpoints
         checkpoint = {
             "model_state_dict": model.state_dict(),
@@ -344,20 +445,25 @@ def train_model(epochs=15, batch_size=512, lr=0.01, embedding_dim=64):
             "movie_embeddings": final_movie_emb.cpu().numpy().tolist(),
         }
         torch.save(model.state_dict(), MODEL_PATH)
-        
+
         # Write embeddings and metadata to mappings
         mappings["user_embeddings"] = checkpoint["user_embeddings"]
         mappings["movie_embeddings"] = checkpoint["movie_embeddings"]
         with open(MAPPINGS_PATH, "w") as f:
             json.dump(mappings, f)
-            
+
         # Record training metrics
         metrics = {
             "final_epoch_loss": float(epoch_losses[-1]),
             "num_epochs": epochs,
             "total_ratings": len(ratings_rows),
+            "num_train_ratings": len(train_users),
+            "num_test_ratings": len(test_users_l),
             "num_users": len(user_to_idx),
             "num_movies": len(movie_to_idx),
+            "test_rmse": test_rmse,
+            "precision_at_10": precision_at_10,
+            "recall_at_10": recall_at_10,
             "device": str(device)
         }
         
