@@ -2,5 +2,7 @@ week-7/website/frontend/node_modules/
 week-7/website/backend/venv/
 week-7/website/backend/__pycache__/
 
+week-5/assignment/data/
+
 .DS_Store
 Thumbs.db
